@@ -1,4 +1,4 @@
-name: Main
+name: Collect Cosmos Testnet Data
 
 on:
   workflow_dispatch:
