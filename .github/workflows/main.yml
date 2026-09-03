@@ -1,0 +1,12 @@
+name: Main
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run on the 1st of every month (covers the previous month)
+    - cron: '0 0 1 * *'
+
+jobs:
+  uptime-tracker:
+    uses: ./.github/workflows/uptimer-tracker.yml
+    secrets: inherit

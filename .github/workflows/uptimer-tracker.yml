@@ -2,9 +2,7 @@ name: Uptime Tracker
 
 on:
   workflow_dispatch:
-  schedule:
-    # Run on the 1st of every month (covers the previous month)
-    - cron: '0 0 1 * *'
+  workflow_call:
 
 env:
   RPC_NODE: 'https://rpc.provider-sentry-02.hub-testnet.polypore.xyz'
