@@ -1,0 +1,44 @@
+name: Uptime Tracker
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run on the 1st of every month (covers the previous month)
+    - cron: '0 0 1 * *'
+
+env:
+  RPC_NODE: 'https://rpc.provider-sentry-02.hub-testnet.polypore.xyz'
+  API_NODE: 'https://rest.provider-sentry-01.hub-testnet.polypore.xyz'
+
+jobs:
+  uptime-tracker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compute last month
+        id: date
+        run: echo "year_month=$(date -d 'last month' +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Run uptime tracker
+        working-directory: src
+        run: |
+          python uptime_tracker.py \
+            -r "$RPC_NODE" \
+            -a "$API_NODE" \
+            -m ${{ steps.date.outputs.year_month }}
+
+      - name: Upload uptime CSV
+        uses: actions/upload-artifact@v7
+        with:
+          name: uptime-${{ steps.date.outputs.year_month }}
+          path: src/${{ steps.date.outputs.year_month }}-*-uptime.csv
