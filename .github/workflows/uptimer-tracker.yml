@@ -9,7 +9,7 @@ env:
 
 jobs:
   uptime-tracker:
-    runs-on: ubuntu-latest
+    runs-on: cosmos-runner-set
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -19,8 +19,25 @@ jobs:
         with:
           python-version: '3.x'
 
+      - name: Create virtual environment
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Get current running gaiad version
+        run: |
+          RUNNING_VERSION=$(curl -s https://$RPC_NODE/abci_info | jq -r '.result.response.version')
+          echo "Running gaiad version: $RUNNING_VERSION"
+          echo "RUNNING_VERSION=$RUNNING_VERSION" >> $GITHUB_ENV
+
+      - name: Download binary from cosmos/gaia repo
+        run: |
+          sudo wget -nv https://github.com/cosmos/gaia/releases/download/${{ env.RUNNING_VERSION }}/gaiad-${{ env.RUNNING_VERSION }}-linux-amd64 -O /usr/local/bin/gaiad
+          sudo chmod +x /usr/local/bin/gaiad
+          gaiad version
 
       - name: Compute last month
         id: date
