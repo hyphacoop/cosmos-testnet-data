@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: validator-report
+  cancel-in-progress: false
+
 env:
   RPC_NODE: 'https://rpc.provider-archive-01.hub-testnet.polypore.xyz'
   API_NODE: 'https://rest.provider-archive-01.hub-testnet.polypore.xyz'
