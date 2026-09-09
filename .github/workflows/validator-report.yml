@@ -1,0 +1,108 @@
+name: Validator Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: 'Period to report on (YYYY-MM-DD). Leave blank to use yesterday.'
+        required: false
+        type: string
+  schedule:
+    # Run an hour after midnight UTC, reporting on the previous day
+    - cron: '0 1 * * *'
+
+permissions:
+  contents: write
+
+env:
+  RPC_NODE: 'https://rpc.provider-archive-01.hub-testnet.polypore.xyz'
+  API_NODE: 'https://rest.provider-archive-01.hub-testnet.polypore.xyz'
+
+jobs:
+  validator-report:
+    runs-on: cosmos-runner-set
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install wget, curl, and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl jq
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Create virtual environment
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Get current running gaiad version
+        run: |
+          RUNNING_VERSION=$(curl -s $RPC_NODE/abci_info | jq -r '.result.response.version')
+          echo "Running gaiad version: $RUNNING_VERSION"
+          echo "RUNNING_VERSION=$RUNNING_VERSION" >> $GITHUB_ENV
+
+      - name: Download binary from cosmos/gaia repo
+        run: |
+          sudo wget -nv https://github.com/cosmos/gaia/releases/download/${{ env.RUNNING_VERSION }}/gaiad-${{ env.RUNNING_VERSION }}-linux-amd64 -O /usr/local/bin/gaiad
+          sudo chmod +x /usr/local/bin/gaiad
+          gaiad version
+
+      - name: Compute period
+        id: date
+        run: |
+          if [ -n "${{ inputs.period }}" ]; then
+            echo "period=${{ inputs.period }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "period=$(date -d 'yesterday' +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run validator report
+        working-directory: src
+        run: |
+          python validator_report.py \
+            -r "$RPC_NODE" \
+            -a "$API_NODE" \
+            -p ${{ steps.date.outputs.period }} \
+            -i "${{ runner.temp }}/validator_report.${{ steps.date.outputs.period }}.checkpoint.json"
+
+      - name: Move report into data_collected directory
+        id: move
+        run: |
+          PERIOD="${{ steps.date.outputs.period }}"
+          YEAR=$(date -d "$PERIOD" +%Y)
+          MONTH=$(date -d "$PERIOD" +%m)
+          DEST_DIR="data_collected/$YEAR/$MONTH"
+          mkdir -p "$DEST_DIR"
+          mv "src/validator_report.$PERIOD.csv" "$DEST_DIR/"
+          echo "dest_dir=$DEST_DIR" >> "$GITHUB_OUTPUT"
+          echo "year_month=${YEAR}-${MONTH}" >> "$GITHUB_OUTPUT"
+          echo "report_path=$DEST_DIR/validator_report.$PERIOD.csv" >> "$GITHUB_OUTPUT"
+
+      - name: Build month-to-date master report
+        id: aggregate
+        working-directory: src
+        run: |
+          YEAR_MONTH="${{ steps.move.outputs.year_month }}"
+          python aggregate_validator_report.py -p "$YEAR_MONTH" -d ../data_collected
+          echo "master_path=${{ steps.move.outputs.dest_dir }}/validator_report.$YEAR_MONTH.csv" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.move.outputs.report_path }}" "${{ steps.aggregate.outputs.master_path }}"
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Add validator report for ${{ steps.date.outputs.period }}"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
