@@ -16,7 +16,7 @@ cosmos-tools package.
 Arguments:
 - rpc endpoint
 - api endpoint
-- period (YYYY-MM)
+- period (YYYY-MM for a full month, or YYYY-MM-DD for a single day)
 - output filename (optional)
 - checkpoint filename (optional)
 - number of worker threads (optional, default 10)
@@ -48,6 +48,7 @@ import json
 import csv
 import logging
 import os.path
+import re
 import time
 
 TIME_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
@@ -323,12 +324,19 @@ def clean_timestamp(timestamp: str) -> datetime:
 def period_bounds(period: str):
     '''
     Returns (start_time, end_time) UTC datetimes spanning the given
-    YYYY-MM period, from its first second to its last.
+    period, from its first second to its last. Accepts either a full
+    month (YYYY-MM) or a single day (YYYY-MM-DD).
     '''
-    year, month = (int(part) for part in period.split('-'))
-    start_time = datetime(year, month, 1)
-    last_day = calendar.monthrange(year, month)[1]
-    end_time = datetime(year, month, last_day, 23, 59, 59)
+    parts = [int(part) for part in period.split('-')]
+    year, month = parts[0], parts[1]
+    if len(parts) == 3:
+        day = parts[2]
+        start_time = datetime(year, month, day)
+        end_time = datetime(year, month, day, 23, 59, 59)
+    else:
+        start_time = datetime(year, month, 1)
+        last_day = calendar.monthrange(year, month)[1]
+        end_time = datetime(year, month, last_day, 23, 59, 59)
     return start_time, end_time
 
 
@@ -801,6 +809,12 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 
+def period_type(value):
+    if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?', value):
+        raise argparse.ArgumentTypeError(f"'{value}' is not in YYYY-MM or YYYY-MM-DD format")
+    return value
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Build a per-period report of every validator in the network: '
@@ -808,7 +822,7 @@ if __name__ == '__main__':
     )
     parser.add_argument('-r', '--rpc', type=str, required=True, help='RPC node address, including port')
     parser.add_argument('-a', '--api', type=str, required=True, help='API node address, including port')
-    parser.add_argument('-p', '--period', type=str, required=True, help='Period to check, in YYYY-MM format')
+    parser.add_argument('-p', '--period', type=period_type, required=True, help='Period to check: YYYY-MM for a full month, or YYYY-MM-DD for a single day')
     parser.add_argument('-o', '--output', type=str, help='Filename to save the validator report to (default: validator_report.<period>.csv)')
     parser.add_argument('-i', '--input', type=str, help='Checkpoint JSON filename to resume an interrupted scan (default: validator_report.<period>.json)')
     parser.add_argument('-w', '--workers', type=int, default=10, help='Number of concurrent worker threads for RPC fetches')
