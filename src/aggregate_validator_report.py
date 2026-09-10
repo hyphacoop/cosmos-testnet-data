@@ -27,9 +27,7 @@ python -m validator_report.aggregate_validator_report \
     -d data_collected
 '''
 
-from datetime import date
 import argparse
-import calendar
 import csv
 import glob
 import logging
@@ -62,9 +60,6 @@ FIELDNAMES = [
     'jailed_reason',
 ]
 
-HEADER_BLOCKS_RE = re.compile(r'blocks (\d+)-(\d+)')
-
-
 def find_daily_reports(directory: str, period: str):
     '''
     Returns the sorted list of daily report paths for the given YYYY-MM
@@ -77,18 +72,12 @@ def find_daily_reports(directory: str, period: str):
 
 def read_daily_report(path: str):
     '''
-    Returns (start_block, end_block, rows) for one daily CSV, where
-    rows is a list of dicts as written by validator_report.py's
+    Returns the rows for one daily CSV, as written by validator_report.py's
     save_csv().
     '''
     with open(path, 'r', encoding='utf-8') as input_file:
-        header_line = input_file.readline()
         reader = csv.DictReader(input_file)
-        rows = list(reader)
-    match = HEADER_BLOCKS_RE.search(header_line)
-    start_block = int(match.group(1)) if match else None
-    end_block = int(match.group(2)) if match else None
-    return start_block, end_block, rows
+        return list(reader)
 
 
 def split_heights(value: str):
@@ -98,18 +87,12 @@ def split_heights(value: str):
 def merge_daily_reports(paths):
     '''
     Folds a chronological list of daily report paths into a single
-    dict keyed by cosmosvaloper, plus the overall (first_start_block,
-    last_end_block) span.
+    dict keyed by cosmosvaloper.
     '''
     merged = {}
-    first_start_block = None
-    last_end_block = None
 
     for path in paths:
-        start_block, end_block, rows = read_daily_report(path)
-        if first_start_block is None:
-            first_start_block = start_block
-        last_end_block = end_block
+        rows = read_daily_report(path)
 
         for row in rows:
             key = row['cosmosvaloper']
@@ -155,7 +138,7 @@ def merge_daily_reports(paths):
                     entry['jailed_block'] = row['jailed_block']
                     entry['jailed_reason'] = row['jailed_reason']
 
-    return merged, first_start_block, last_end_block
+    return merged
 
 
 def build_rows(merged):
@@ -183,13 +166,8 @@ def build_rows(merged):
     return rows
 
 
-def save_csv(output_file, period, first_start_block, last_end_block, num_reports, rows):
+def save_csv(output_file, rows):
     with open(output_file, 'w', encoding='utf-8') as output:
-        block_range = f'{first_start_block}-{last_end_block}' if first_start_block is not None else 'unknown'
-        output.writelines([
-            f'Period {period}, blocks {block_range} '
-            f'(aggregated from {num_reports} daily reports)\n'
-        ])
         writer = csv.DictWriter(output, fieldnames=FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
@@ -222,6 +200,6 @@ if __name__ == '__main__':
         raise SystemExit(f'No daily reports found for {args.period} in {directory}')
     logging.info(f'Aggregating {len(daily_reports)} daily reports from {directory}')
 
-    merged, first_start_block, last_end_block = merge_daily_reports(daily_reports)
+    merged = merge_daily_reports(daily_reports)
     rows = build_rows(merged)
-    save_csv(output_file, args.period, first_start_block, last_end_block, len(daily_reports), rows)
+    save_csv(output_file, rows)
