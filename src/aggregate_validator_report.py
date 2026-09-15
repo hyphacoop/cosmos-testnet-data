@@ -15,6 +15,10 @@ that's stable even across consensus-key rotation):
   daily file that reports a jailing (the normal case is at most one
   jailing event per validator per month)
 
+The output only includes validators that are currently jailed or that
+rejoined the active set at some point in the period -- validators with
+neither are dropped.
+
 This produces the same result as running validator_report.py directly
 with a YYYY-MM period, provided a daily CSV exists for every day of the
 month scanned so far, and this is run on (or after) the day the last of
@@ -144,6 +148,10 @@ def merge_daily_reports(paths):
 def build_rows(merged):
     rows = []
     for entry in merged.values():
+        jailed = entry['jailed'] == 'True'
+        joined_active_set = bool(entry['joined_heights'])
+        if not jailed and not joined_active_set:
+            continue
         rows.append({
             'cosmosvaloper': entry['cosmosvaloper'],
             'cosmos': entry['cosmos'],
@@ -155,7 +163,7 @@ def build_rows(merged):
             'jailed': entry['jailed'],
             'left_active_set': bool(entry['left_heights']),
             'left_heights': '|'.join(entry['left_heights']),
-            'joined_active_set': bool(entry['joined_heights']),
+            'joined_active_set': joined_active_set,
             'joined_heights': '|'.join(entry['joined_heights']),
             'jailed_during_period': entry['jailed_during_period'],
             'jailed_time': entry['jailed_time'],
