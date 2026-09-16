@@ -711,9 +711,6 @@ class ValidatorReport():
             'detection_method',
         ]
         with open(self.output_file, 'w', encoding='utf-8') as output:
-            output.writelines([
-                f'Period {self.period}, blocks {self.start_block}-{self.end_block}\n'
-            ])
             writer = csv.DictWriter(output, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)

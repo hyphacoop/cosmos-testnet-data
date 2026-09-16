@@ -70,15 +70,8 @@ jobs:
           mv "src/validator_report.$PERIOD.csv" "$DEST_DIR/"
           echo "report_path=$DEST_DIR/validator_report.$PERIOD.csv" >> "$GITHUB_OUTPUT"
 
-      - name: Commit and push report
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ steps.move.outputs.report_path }}"
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Add validator report for ${{ steps.date.outputs.period }}"
-            git pull --rebase origin main
-            git push origin HEAD:main
-          fi
+      - name: Upload validator report CSV
+        uses: actions/upload-artifact@v7
+        with:
+          name: validator-report-${{ steps.date.outputs.period }}
+          path: ${{ steps.move.outputs.report_path }}
