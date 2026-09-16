@@ -8,5 +8,9 @@ on:
 
 jobs:
   uptime-tracker:
-    uses: ./.github/workflows/uptimer-tracker.yml
+    uses: ./.github/workflows/uptime-tracker.yml
+    secrets: inherit
+
+  validator-report:
+    uses: ./.github/workflows/validator-report.yml
     secrets: inherit

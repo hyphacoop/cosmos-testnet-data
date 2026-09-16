@@ -1,22 +1,10 @@
 name: Validator Report
 
 on:
-  workflow_dispatch:
-    inputs:
-      period:
-        description: 'Period to report on (YYYY-MM-DD). Leave blank to use yesterday.'
-        required: false
-        type: string
-  schedule:
-    # Run an hour after midnight UTC, reporting on the previous day
-    - cron: '0 1 * * *'
+  workflow_call:
 
 permissions:
   contents: write
-
-concurrency:
-  group: validator-report
-  cancel-in-progress: false
 
 env:
   RPC_NODE: 'https://rpc.provider-archive-01.hub-testnet.polypore.xyz'
@@ -59,14 +47,9 @@ jobs:
           sudo chmod +x /usr/local/bin/gaiad
           gaiad version
 
-      - name: Compute period
+      - name: Compute last month
         id: date
-        run: |
-          if [ -n "${{ inputs.period }}" ]; then
-            echo "period=${{ inputs.period }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "period=$(date -d 'yesterday' +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-          fi
+        run: echo "period=$(date -d 'last month' +%Y-%m)" >> "$GITHUB_OUTPUT"
 
       - name: Run validator report
         working-directory: src
@@ -74,35 +57,24 @@ jobs:
           python validator_report.py \
             -r "$RPC_NODE" \
             -a "$API_NODE" \
-            -p ${{ steps.date.outputs.period }} \
-            -i "${{ runner.temp }}/validator_report.${{ steps.date.outputs.period }}.checkpoint.json"
+            -p ${{ steps.date.outputs.period }}
 
       - name: Move report into data_collected directory
         id: move
         run: |
           PERIOD="${{ steps.date.outputs.period }}"
-          YEAR=$(date -d "$PERIOD" +%Y)
-          MONTH=$(date -d "$PERIOD" +%m)
+          YEAR=$(date -d "${PERIOD}-01" +%Y)
+          MONTH=$(date -d "${PERIOD}-01" +%m)
           DEST_DIR="data_collected/$YEAR/$MONTH"
           mkdir -p "$DEST_DIR"
           mv "src/validator_report.$PERIOD.csv" "$DEST_DIR/"
-          echo "dest_dir=$DEST_DIR" >> "$GITHUB_OUTPUT"
-          echo "year_month=${YEAR}-${MONTH}" >> "$GITHUB_OUTPUT"
           echo "report_path=$DEST_DIR/validator_report.$PERIOD.csv" >> "$GITHUB_OUTPUT"
-
-      - name: Build month-to-date master report
-        id: aggregate
-        working-directory: src
-        run: |
-          YEAR_MONTH="${{ steps.move.outputs.year_month }}"
-          python aggregate_validator_report.py -p "$YEAR_MONTH" -d ../data_collected
-          echo "master_path=${{ steps.move.outputs.dest_dir }}/validator_report.$YEAR_MONTH.csv" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push report
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ steps.move.outputs.report_path }}" "${{ steps.aggregate.outputs.master_path }}"
+          git add "${{ steps.move.outputs.report_path }}"
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else

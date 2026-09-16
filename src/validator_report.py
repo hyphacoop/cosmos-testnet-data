@@ -1,35 +1,50 @@
+#!/usr/bin/env python3
 '''
-Builds a full validator report for a given calendar month (YYYY-MM),
-listing every validator known to the network and, for the specified
-period:
-- whether it left the active set, and at which blocks it joined/left
-- whether it was jailed, and an estimate of when/at which block
+Builds a validator jailing report for a given calendar month (YYYY-MM),
+listing every validator that was jailed at some point during the period,
+along with when and why.
 
-Requires an archive API node: the active-set scan and jailed-block
-estimation both query historical application state at arbitrary block
-heights across the scanned period.
+A validator can be jailed for exactly three reasons, and each is detected
+differently:
+- Downtime (missing too many blocks): detected via a `block_search` query for
+  the slashing module's `slash{reason='missing_signature'}` event.
+- Double-signing (equivocation): always jails *and* tombstones the validator
+  permanently; detected via `block_search` for `slash{reason='double_sign'}`.
+- Self-delegation dropping below the validator's minimum: the staking module
+  jails the validator with no dedicated event, so this is detected by finding
+  `MsgUndelegate` transactions where the delegator is the validator's own
+  account (via `tx_search`), then confirming the validator's jailed status
+  flipped at that block.
 
-Standalone version: all helper code (from utils and time_to_block) is
-inlined below so this file has no dependency on the rest of the
-cosmos-tools package.
+Both `slash` events above are emitted in BeginBlock, not inside a transaction,
+so they are only visible through CometBFT's `block_search` RPC method (which
+indexes FinalizeBlock events: begin+end+tx) -- never through `tx_search`
+(which only sees tx-execution events).
+
+Requires the RPC endpoint to have tx/block indexing enabled
+(`config.toml`'s `[tx_index] indexer = "kv"`) and an `index-events` setting
+(`app.toml`) that doesn't exclude `slash.*`/`message.action` -- not guaranteed
+on an arbitrary public endpoint. If indexed search isn't available, this
+script falls back to a `signing_infos`-based snapshot, which can only recover
+downtime jailings (not self-delegation jailings, and not the timing of
+tombstonings) -- see `detect_via_signing_infos_fallback`.
 
 Arguments:
 - rpc endpoint
 - api endpoint
-- period (YYYY-MM for a full month, or YYYY-MM-DD for a single day)
+- period (YYYY-MM)
 - output filename (optional)
-- checkpoint filename (optional)
-- number of worker threads (optional, default 10)
-- batch size (optional, default 100)
+- number of worker threads for self-delegation confirmation (optional, default 5)
 
-Outputs a CSV with one row per validator in the network:
+Outputs a CSV with one row per validator jailed during the period (validators
+never jailed in the period are omitted entirely):
 - Validator ID (valoper, cosmos, moniker, pubkey, address, cosmosvalcons)
-- Current bonded/jailed status
-- Whether/when it left and re-joined the active set during the period
-- Whether/when it was jailed during the period
+- When/why it was jailed (block, time, reason, whether it was tombstoned)
+
+Standalone: the only third-party dependency is `requests` (Python 3.9+).
 
 Example:
-python -m validator_report.validator_report \
+python validator_report.py \
     -r <rpc endpoint> \
     -a <api endpoint> \
     -p 2026-08
@@ -38,343 +53,353 @@ python -m validator_report.validator_report \
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import argparse
-import calendar
-import requests
-import urllib
 import base64
-import hashlib
-import command
-import json
+import binascii
+import calendar
 import csv
+import hashlib
 import logging
-import os.path
-import re
-import time
+
+import requests
 
 TIME_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
-# time_to_block's clip_timestamp() requires a fractional-seconds component
-# (it splits on '.' and indexes into the result), so any timestamp handed
-# to it must be formatted with one, even if it's all zeros.
-RPC_TIME_FORMAT = '%Y-%m-%dT%H:%M:%S.000Z'
+REQUEST_TIMEOUT = 60
 
 
-# ---------------------------------------------------------------------------
-# From utils/utils.py
-# ---------------------------------------------------------------------------
+# ---- timestamps ----
 
-def get_status(urlRPC: str):
-    endpoint = f"{urlRPC}/status"
-    response = requests.get(endpoint).json()["result"]
-    return response
+def parse_timestamp(timestamp: str) -> datetime:
+    '''
+    Parses an RFC 3339 chain timestamp into a naive UTC datetime. CometBFT
+    emits up to nanosecond precision (and omits the fraction entirely when
+    it's zero), so the fraction is optional and truncated to microseconds.
+    '''
+    base, _, fraction = timestamp.rstrip('Z').partition('.')
+    parsed = datetime.strptime(base, '%Y-%m-%dT%H:%M:%S')
+    if fraction:
+        parsed = parsed.replace(microsecond=int(fraction[:6].ljust(6, '0')))
+    return parsed
 
-
-def consensus_pubkey_to_bytes_address(pubkey: str):
-    """
-    Derives the Tendermint validator address (uppercase hex, bytes format)
-    directly from a base64-encoded ed25519 consensus pubkey.
-
-    Unlike RPC/CLI validator-set lookups, which only return the current
-    live signing set, this works for any validator regardless of bond
-    status (jailed, unbonding, unbonded, or never previously seen), since
-    the address is just the first 20 bytes of the SHA-256 hash of the
-    raw pubkey.
-    """
-    raw_pubkey = base64.b64decode(pubkey)
-    return hashlib.sha256(raw_pubkey).digest()[:20].hex().upper()
-
-
-def bytes_to_consensus_address(address, binary: str = "gaiad"):
-    """
-    Converts bytes address to cosmosvalcons format
-    """
-    p = command.run([binary, "keys", "parse", address])
-    res = p.output.split()[10]
-    return res.decode("utf-8")
-
-
-def consensus_address_to_bytes(address, binary: str = "gaiad"):
-    """
-    Converts cosmosvalcons address to hex bytes format
-    """
-    p = command.run([binary, "keys", "parse", address, "--output", "json"])
-    res = p.output.decode("utf-8")
-    res_json = json.loads(res)
-    return res_json["bytes"]
-
-
-def cosmosvaloper_to_cosmos(address, binary: str = "gaiad"):
-    """
-    Converts bytes address to cosmos format
-    """
-    bytes_address = consensus_address_to_bytes(address, binary)
-    p = command.run([binary, "keys", "parse", bytes_address, "--output", "json"])
-    res = p.output.decode("utf-8")
-    res_json = json.loads(res)
-    return res_json["formats"][0]
-
-
-def collect_rpc_validators(urlRPC, height: int = 0):
-    """
-    Collects validators info at the latest block height
-    - Address in bytes format
-    - pubkey
-    - voting power
-    - proposer priority
-    """
-    page = 1
-    if height > 0:
-        response = requests.get(
-            f"{urlRPC}/validators?page={page}&height={height}"
-        ).json()["result"]
-    else:
-        response = requests.get(f"{urlRPC}/validators?page={page}").json()["result"]
-    val_count = int(response["count"])
-    total = int(response["total"])
-    rpc_vals = response["validators"]
-
-    while val_count < total:
-        page += 1
-        if height > 0:
-            response = requests.get(
-                f"{urlRPC}/validators?page={page}&height={height}"
-            ).json()["result"]
-        else:
-            response = requests.get(f"{urlRPC}/validators?page={page}").json()["result"]
-        val_count += int(response["count"])
-        rpc_vals.extend(response["validators"])
-    return rpc_vals
-
-
-def collect_api_validators(urlAPI, height: int = 0):
-    """
-    Collects the validators info at the specified height
-    - operator address in cosmosvaloper format
-    - consensus pubkey
-    - jailed status
-    - tokens
-    - delegator shares
-    - moniker
-    - and more
-    """
-    if height > 0:
-        response = requests.get(
-            f"{urlAPI}/cosmos/staking/v1beta1/validators?pagination.limit=1000",
-            headers={"x-cosmos-block-height": f"{height}"},
-        ).json()
-    else:
-        response = requests.get(f"{urlAPI}/cosmos/staking/v1beta1/validators").json()
-    total = int(response["pagination"]["total"])
-    api_vals = response["validators"]
-    next_key = response["pagination"]["next_key"]
-    while next_key:
-        response = requests.get(
-            f"{urlAPI}/cosmos/staking/v1beta1/validators?pagination.limit=1000&pagination.key="
-            f"{urllib.parse.quote(next_key)}",
-            headers={"x-cosmos-block-height": f"{height}"},
-        ).json()
-        api_vals.extend(response["validators"])
-        next_key = response["pagination"]["next_key"]
-    return api_vals
-
-
-def collect_api_validator_set(urlAPI, height: int = 0):
-    """
-    Collects the validator set at the specified height
-    - consensus address in cosmosvalcons format
-    - consensus pubkey
-    - proposer_priority
-    - voting power
-    """
-    if height > 0:
-        response = requests.get(
-            f"{urlAPI}/cosmos/base/tendermint/v1beta1/validatorsets/{height}"
-        ).json()
-    else:
-        response = requests.get(
-            f"{urlAPI}/cosmos/base/tendermint/v1beta1/validatorsets/latest"
-        ).json()
-    api_vals = response["validators"]
-    total = int(response["pagination"]["total"])
-    page = 2
-    while len(api_vals) < total:
-        if height > 0:
-            response = requests.get(
-                f"{urlAPI}/cosmos/base/tendermint/v1beta1/validatorsets/{height}?page={page}"
-            ).json()
-        else:
-            response = requests.get(
-                f"{urlAPI}/cosmos/base/tendermint/v1beta1/validatorsets/latest?page={page}"
-            ).json()
-        api_vals.extend(response["validators"])
-        page += 1
-    return api_vals
-
-
-def get_slashing_params(urlAPI: str, height: int = 0):
-    """
-    Returns the info array
-    """
-    endpoint = f"{urlAPI}/cosmos/slashing/v1beta1/params"
-    if height:
-        response = requests.get(
-            endpoint, headers={"x-cosmos-block-height": f"{height}"}
-        ).json()
-    else:
-        response = requests.get(endpoint).json()
-    if "params" in response:
-        return response["params"]
-    return []
-
-
-def get_signing_infos(urlAPI: str, height: int = 0):
-    """
-    Returns the info array
-    """
-    endpoint = f"{urlAPI}/cosmos/slashing/v1beta1/signing_infos?pagination.limit=1000"
-    if height:
-        response = requests.get(
-            endpoint, headers={"x-cosmos-block-height": f"{height}"}
-        ).json()
-    else:
-        response = requests.get(endpoint).json()
-    if "info" in response:
-        return response["info"]
-    return []
-
-
-# ---------------------------------------------------------------------------
-# From time_to_block/time_to_block.py
-# ---------------------------------------------------------------------------
-
-def ttb_get_block(urlRPC, height: int = 0):
-    if height > 0:
-        response = requests.get(urlRPC + '/block?height=' + str(height)).json()
-    else:
-        response = requests.get(urlRPC + '/block').json()
-    if 'result' not in response:
-        print(response)
-    return response['result']['block']
-
-
-def ttb_get_block_timestamp(urlRPC, height: int = 0):
-    return ttb_get_block(urlRPC, height)['header']['time']
-
-
-def ttb_clip_timestamp(timestamp: str):
-    clipped_timestamp = timestamp.split('.')
-    if len(clipped_timestamp[1]) > 7:
-        clipped_timestamp[1] = clipped_timestamp[1][:6] + 'Z'
-    return '.'.join(clipped_timestamp)
-
-
-def ttb_time_difference(ts_newer: str, ts_older: str):
-    ts_new = ttb_clip_timestamp(ts_newer)
-    ts_old = ttb_clip_timestamp(ts_older)
-    dt_new = datetime.strptime(ts_new, '%Y-%m-%dT%H:%M:%S.%fZ')
-    dt_old = datetime.strptime(ts_old, '%Y-%m-%dT%H:%M:%S.%fZ')
-    time_diff = dt_new - dt_old
-    return time_diff.total_seconds()
-
-
-def ttb_get_block_time(urlRPC, height: int = 0):
-    if height == 0:
-        height = int(ttb_get_block(urlRPC)['header']['height'])
-    reference_ts = ttb_get_block(urlRPC, height)['header']['time']
-    minus_one_ts = ttb_get_block(urlRPC, height - 1)['header']['time']
-    return ttb_time_difference(reference_ts, minus_one_ts)
-
-
-def ttb_move(RPC, block, TIME):
-    new_timestamp = ttb_get_block_timestamp(RPC, block)
-    new_time_delta = ttb_time_difference(new_timestamp, TIME)  # returns negative value if first argument is in the past
-    return new_time_delta
-
-
-def time_to_block(rpc: str, time: str, precision: int, dampener: float):
-    # Obtain current block time
-    block = int(ttb_get_block(rpc)['header']['height'])
-    starting_timestamp = ttb_get_block_timestamp(rpc, block)
-    time_delta = ttb_time_difference(starting_timestamp, time)
-    while abs(time_delta) > precision:
-        # Estimate the block difference: delta / block time = s / (s / block) = blocks
-        block_time = ttb_get_block_time(rpc, block)
-        block_delta_estimate = int((time_delta / block_time) * dampener)
-        if abs(block_delta_estimate) < 1:
-            break
-        block -= block_delta_estimate
-        time_delta = ttb_move(rpc, block, time)
-    diff = abs(ttb_time_difference(ttb_get_block_timestamp(rpc, block), time))
-    return block, diff
-
-
-# ---------------------------------------------------------------------------
-# Report logic
-# ---------------------------------------------------------------------------
 
 def clean_timestamp(timestamp: str) -> datetime:
     '''
     Parses a chain timestamp, discarding any fractional seconds.
     '''
-    ts = timestamp
-    if '.' in timestamp:
-        ts = timestamp.split('.')[0] + 'Z'
-    return datetime.strptime(ts, TIME_FORMAT)
+    return parse_timestamp(timestamp).replace(microsecond=0)
+
+
+# ---- bech32 address conversion (BIP-173) ----
+
+BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
+
+
+def _bech32_polymod(values):
+    generator = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    checksum = 1
+    for value in values:
+        top = checksum >> 25
+        checksum = (checksum & 0x1ffffff) << 5 ^ value
+        for i in range(5):
+            checksum ^= generator[i] if (top >> i) & 1 else 0
+    return checksum
+
+
+def _bech32_hrp_expand(hrp: str):
+    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+
+
+def _convert_bits(data, from_bits: int, to_bits: int, pad: bool):
+    acc = 0
+    bits = 0
+    result = []
+    max_value = (1 << to_bits) - 1
+    for value in data:
+        acc = (acc << from_bits) | value
+        bits += from_bits
+        while bits >= to_bits:
+            bits -= to_bits
+            result.append((acc >> bits) & max_value)
+    if pad and bits:
+        result.append((acc << (to_bits - bits)) & max_value)
+    return result
+
+
+def bech32_encode(hrp: str, data: bytes) -> str:
+    values = _convert_bits(data, 8, 5, pad=True)
+    polymod = _bech32_polymod(_bech32_hrp_expand(hrp) + values + [0] * 6) ^ 1
+    checksum = [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+    return hrp + '1' + ''.join(BECH32_CHARSET[v] for v in values + checksum)
+
+
+def bech32_decode(address: str):
+    '''
+    Returns (hrp, data bytes) for a bech32 address.
+    '''
+    hrp, _, encoded = address.lower().rpartition('1')
+    if not hrp or len(encoded) < 6 or any(c not in BECH32_CHARSET for c in encoded):
+        raise ValueError(f'Invalid bech32 address: {address}')
+    values = [BECH32_CHARSET.index(c) for c in encoded]
+    if _bech32_polymod(_bech32_hrp_expand(hrp) + values) != 1:
+        raise ValueError(f'Invalid bech32 checksum: {address}')
+    return hrp, bytes(_convert_bits(values[:-6], 5, 8, pad=False))
+
+
+def cosmosvaloper_to_cosmos(cosmosvaloper: str) -> str:
+    '''
+    Converts an operator address to its account address (same bytes,
+    e.g. cosmosvaloper... -> cosmos...).
+    '''
+    hrp, data = bech32_decode(cosmosvaloper)
+    return bech32_encode(hrp.removesuffix('valoper'), data)
+
+
+def consensus_pubkey_to_bytes_address(pubkey: str) -> str:
+    '''
+    Derives the CometBFT validator address (uppercase hex) from a
+    base64-encoded ed25519 consensus pubkey: the first 20 bytes of the
+    SHA-256 hash of the raw pubkey. Works for any validator regardless of
+    bond status.
+    '''
+    return hashlib.sha256(base64.b64decode(pubkey)).digest()[:20].hex().upper()
+
+
+def bytes_to_consensus_address(bytes_address: str, cosmosvaloper: str) -> str:
+    '''
+    Converts a hex validator address to cosmosvalcons format, taking the
+    chain's bech32 prefix from the validator's operator address.
+    '''
+    hrp, _ = bech32_decode(cosmosvaloper)
+    return bech32_encode(hrp.removesuffix('valoper') + 'valcons', bytes.fromhex(bytes_address))
+
+
+# ---- RPC queries ----
+
+def rpc_call(rpc: str, method: str, params: dict) -> dict:
+    '''
+    Issues a JSON-RPC request and returns the full response, including any
+    'error' key.
+    '''
+    return requests.post(
+        rpc,
+        json={'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params},
+        timeout=REQUEST_TIMEOUT,
+    ).json()
+
+
+def rpc_search(rpc: str, method: str, query: str, per_page: int = 100):
+    '''
+    Runs a paginated tx_search or block_search query and returns every hit.
+    Returns None (not []) if the endpoint rejects the query outright, so
+    callers can distinguish "indexing unavailable" from "zero matches".
+    '''
+    result_key = 'txs' if method == 'tx_search' else 'blocks'
+    hits = []
+    page = 1
+    while True:
+        response = rpc_call(rpc, method, {'query': query, 'page': str(page), 'per_page': str(per_page)})
+        if 'error' in response:
+            if page == 1:
+                logging.warning(f"{method} unavailable ({response['error']})")
+                return None
+            logging.warning(f"{method} failed on page {page} ({response['error']}), results are incomplete")
+            return hits
+        result = response.get('result', {})
+        total = int(result.get('total_count') or 0)
+        page_hits = result.get(result_key) or []
+        hits.extend(page_hits)
+        if len(hits) >= total or not page_hits:
+            return hits
+        page += 1
+
+
+def get_status(rpc: str) -> dict:
+    return requests.get(f'{rpc}/status', timeout=REQUEST_TIMEOUT).json()['result']
+
+
+def get_block(rpc: str, height: int = 0) -> dict:
+    params = {'height': height} if height > 0 else {}
+    response = requests.get(f'{rpc}/block', params=params, timeout=REQUEST_TIMEOUT).json()
+    return response['result']['block']
+
+
+def get_block_timestamp(rpc: str, height: int = 0) -> str:
+    return get_block(rpc, height)['header']['time']
+
+
+def get_block_results(rpc: str, height: int) -> dict:
+    response = requests.get(f'{rpc}/block_results', params={'height': height}, timeout=REQUEST_TIMEOUT).json()
+    return response.get('result', {})
+
+
+def time_to_block(rpc: str, target: datetime, precision: int = 8, dampener: float = 0.9) -> int:
+    '''
+    Finds the block closest to the target time: starting from the latest
+    block, repeatedly estimates the block distance from the local block time
+    and jumps there, until within `precision` seconds.
+    '''
+    block = int(get_block(rpc)['header']['height'])
+    time_delta = (parse_timestamp(get_block_timestamp(rpc, block)) - target).total_seconds()
+    while abs(time_delta) > precision:
+        block_time = (
+            parse_timestamp(get_block_timestamp(rpc, block))
+            - parse_timestamp(get_block_timestamp(rpc, block - 1))
+        ).total_seconds()
+        block_delta_estimate = int((time_delta / block_time) * dampener)
+        if abs(block_delta_estimate) < 1:
+            break
+        block -= block_delta_estimate
+        time_delta = (parse_timestamp(get_block_timestamp(rpc, block)) - target).total_seconds()
+    return block
+
+
+# ---- API queries ----
+
+def api_get(api: str, path: str, height: int = 0, params: dict = None) -> dict:
+    headers = {'x-cosmos-block-height': str(height)} if height else {}
+    return requests.get(f'{api}{path}', params=params, headers=headers, timeout=REQUEST_TIMEOUT).json()
+
+
+def collect_api_validators(api: str) -> list:
+    '''
+    Collects every validator in the staking module, across all bond statuses.
+    '''
+    validators = []
+    next_key = None
+    while True:
+        params = {'pagination.limit': 1000}
+        if next_key:
+            params['pagination.key'] = next_key
+        response = api_get(api, '/cosmos/staking/v1beta1/validators', params=params)
+        validators.extend(response['validators'])
+        next_key = response['pagination']['next_key']
+        if not next_key:
+            return validators
+
+
+def collect_api_validator_set(api: str, height: int = 0) -> list:
+    '''
+    Collects the active validator set (cosmosvalcons addresses, pubkeys,
+    voting power) at the given height, or the latest if 0.
+    '''
+    path = f"/cosmos/base/tendermint/v1beta1/validatorsets/{height if height > 0 else 'latest'}"
+    validators = []
+    while True:
+        # CometBFT caps validator pages at 100 regardless of the limit requested.
+        response = api_get(api, path, params={'pagination.limit': 100, 'pagination.offset': len(validators)})
+        page = response['validators']
+        validators.extend(page)
+        if len(validators) >= int(response['pagination']['total']) or not page:
+            return validators
+
+
+def get_validator(api: str, cosmosvaloper: str, height: int = 0) -> dict:
+    '''
+    Fetches a single validator by operator address, optionally at a
+    historical height. Returns {} if it can't be found at that height.
+    '''
+    return api_get(api, f'/cosmos/staking/v1beta1/validators/{cosmosvaloper}', height).get('validator', {})
+
+
+def get_slashing_params(api: str) -> dict:
+    return api_get(api, '/cosmos/slashing/v1beta1/params').get('params', {})
+
+
+def get_signing_infos(api: str) -> list:
+    return api_get(api, '/cosmos/slashing/v1beta1/signing_infos', params={'pagination.limit': 1000}).get('info', [])
 
 
 def period_bounds(period: str):
     '''
     Returns (start_time, end_time) UTC datetimes spanning the given
-    period, from its first second to its last. Accepts either a full
-    month (YYYY-MM) or a single day (YYYY-MM-DD).
+    YYYY-MM period, from its first second to its last.
     '''
-    parts = [int(part) for part in period.split('-')]
-    year, month = parts[0], parts[1]
-    if len(parts) == 3:
-        day = parts[2]
-        start_time = datetime(year, month, day)
-        end_time = datetime(year, month, day, 23, 59, 59)
-    else:
-        start_time = datetime(year, month, 1)
-        last_day = calendar.monthrange(year, month)[1]
-        end_time = datetime(year, month, last_day, 23, 59, 59)
+    year, month = (int(part) for part in period.split('-'))
+    start_time = datetime(year, month, 1)
+    last_day = calendar.monthrange(year, month)[1]
+    end_time = datetime(year, month, last_day, 23, 59, 59)
     return start_time, end_time
 
 
+def _maybe_b64decode(value):
+    '''
+    Attribute keys/values in ABCI events are base64-encoded on some
+    CometBFT/SDK versions and plain UTF-8 on others. Decodes if the value
+    looks like valid base64, otherwise returns it unchanged.
+    '''
+    if not isinstance(value, str):
+        return value
+    try:
+        return base64.b64decode(value, validate=True).decode('utf-8')
+    except (binascii.Error, ValueError):
+        return value
+
+
+def decode_event(event) -> dict:
+    '''
+    Decodes an ABCI event's attributes into a plain {key: value} dict.
+    '''
+    return {
+        _maybe_b64decode(attribute.get('key', '')): _maybe_b64decode(attribute.get('value', ''))
+        for attribute in event.get('attributes', [])
+    }
+
+
+def find_slash_event(block_results: dict, reason: str):
+    '''
+    Looks for a 'slash' event with the given 'reason' attribute across a
+    block_results response, checking every event-list key ABCI has used
+    across SDK/CometBFT versions (begin/end-block events pre-ABCI 2.0,
+    finalize-block events since). Returns the decoded attribute dict, or
+    None if no matching event is found.
+    '''
+    for section in ('finalize_block_events', 'begin_block_events', 'end_block_events'):
+        for event in block_results.get(section) or []:
+            if event.get('type') != 'slash':
+                continue
+            decoded = decode_event(event)
+            if decoded.get('reason') == reason:
+                return decoded
+    return None
+
+
+def self_undelegation_validator(tx: dict, valoper_by_cosmos: dict):
+    '''
+    If this MsgUndelegate tx is a validator undelegating from its own
+    account, returns its cosmosvaloper address; otherwise None.
+
+    Cross-checks the 'unbond' event's 'delegator' attribute (present on some
+    SDK versions) against the 'message' event's 'sender' attribute (always
+    emitted for every Msg), since attribute sets on 'unbond' vary by version.
+    '''
+    sender = None
+    validator_addr = None
+    delegator_addr = None
+    for event in tx.get('tx_result', {}).get('events', []):
+        etype = event.get('type')
+        if etype == 'message':
+            decoded = decode_event(event)
+            if decoded.get('action', '').endswith('MsgUndelegate'):
+                sender = decoded.get('sender') or sender
+        elif etype == 'unbond':
+            decoded = decode_event(event)
+            validator_addr = decoded.get('validator') or validator_addr
+            delegator_addr = decoded.get('delegator') or delegator_addr
+
+    delegator = delegator_addr or sender
+    if not validator_addr or not delegator:
+        return None
+    if valoper_by_cosmos.get(delegator) == validator_addr:
+        return validator_addr
+    return None
+
+
 class ValidatorReport():
-    def __init__(self, rpc, api, period, output, checkpoint, workers=5, batch_size=50):
+    def __init__(self, rpc, api, period, output, workers=5):
         self.rpc = rpc
         self.api = api
         self.period = period
         self.output_file = output
-        self.checkpoint_file = checkpoint
         self.workers = workers
-        self.batch_size = batch_size
-
-        self.historical_data = {}
-        self.previous_valset = []
-        self.pubkey_moniker_dict = {}
-        self.pubkey_valoper_dict = {}
-        self.pubkey_valcons_dict = {}
-        self.pubkey_bonded_dict = {}
-        self.pubkey_jailed_dict = {}
-
-    # ---- checkpoint I/O, for resuming an interrupted block scan ----
-
-    def read_checkpoint(self):
-        '''
-        Reads any previously collected scan data, returns True if found.
-        '''
-        if os.path.isfile(self.checkpoint_file):
-            with open(self.checkpoint_file, 'r') as input:
-                self.historical_data = json.load(input)
-            return True
-
-    def save_checkpoint(self):
-        '''
-        Saves the active-set scan progress to the checkpoint JSON file.
-        '''
-        with open(self.checkpoint_file, 'w', encoding='utf-8') as json_file:
-            json.dump(self.historical_data, json_file, indent=4)
 
     # ---- period -> block range resolution ----
 
@@ -396,15 +421,11 @@ class ValidatorReport():
         if clipped:
             end_time = now
 
-        start_block, _ = time_to_block(
-            self.rpc, start_time.strftime(RPC_TIME_FORMAT), precision=8, dampener=0.9
-        )
+        start_block = time_to_block(self.rpc, start_time)
         if clipped:
             end_block = int(status['sync_info']['latest_block_height'])
         else:
-            end_block, _ = time_to_block(
-                self.rpc, end_time.strftime(RPC_TIME_FORMAT), precision=8, dampener=0.9
-            )
+            end_block = time_to_block(self.rpc, end_time)
 
         self.start_time = start_time
         self.end_time = end_time
@@ -419,283 +440,35 @@ class ValidatorReport():
         bond status), keyed by cosmosvaloper address. Every output row
         comes from this registry.
         '''
-        api_validators = collect_api_validators(self.api)
-        api_validator_set = collect_api_validator_set(self.api)
-        valcons_by_pubkey = {
-            val['pub_key']['key']: val['address'] for val in api_validator_set
-        }
-
         registry = {}
-        for val in api_validators:
+        for val in collect_api_validators(self.api):
             pubkey = val['consensus_pubkey']['key']
             cosmosvaloper = val['operator_address']
-            cosmosvalcons = valcons_by_pubkey.get(pubkey)
+            # Derived from the pubkey rather than looked up in the
+            # validatorsets endpoint, which only covers the active set.
             bytes_address = consensus_pubkey_to_bytes_address(pubkey)
-            if cosmosvalcons is None:
-                # The validatorsets endpoint only covers the current active
-                # set, so unbonded/unbonding validators won't be in it.
-                cosmosvalcons = bytes_to_consensus_address(bytes_address)
             registry[cosmosvaloper] = {
                 'cosmosvaloper': cosmosvaloper,
                 'cosmos': cosmosvaloper_to_cosmos(cosmosvaloper),
                 'moniker': val['description']['moniker'],
                 'pubkey': pubkey,
                 'address': bytes_address,
-                'cosmosvalcons': cosmosvalcons,
+                'cosmosvalcons': bytes_to_consensus_address(bytes_address, cosmosvaloper),
                 'bonded': val['status'] == 'BOND_STATUS_BONDED',
                 'jailed': val['jailed'],
             }
         return registry
 
-    # ---- active-set transition scan (adapted from background_check) ----
-
-    def load_pubkey_dicts(self, height):
-        '''
-        Builds dicts to map a pubkey to moniker, cosmosvaloper, bonded
-        status, jailed status and cosmosvalcons address, at a given height.
-        '''
-        api_validators = collect_api_validators(self.api, height)
-        api_validator_set = collect_api_validator_set(self.api, height)
-        self.pubkey_moniker_dict = {
-            val['consensus_pubkey']['key']: val['description']['moniker']
-            for val in api_validators
-        }
-        self.pubkey_valoper_dict = {
-            val['consensus_pubkey']['key']: val['operator_address']
-            for val in api_validators
-        }
-        self.pubkey_bonded_dict = {
-            val['consensus_pubkey']['key']: val['status']
-            for val in api_validators
-        }
-        self.pubkey_jailed_dict = {
-            val['consensus_pubkey']['key']: val['jailed']
-            for val in api_validators
-        }
-        self.pubkey_valcons_dict = {
-            val['pub_key']['key']: val['address']
-            for val in api_validator_set
-        }
-
-    def new_transition_entry(self, pubkey, address, height, joined):
-        '''
-        Builds a fresh transitions-dict entry for a validator, resolving
-        its identifying fields from the currently loaded pubkey dicts.
-        '''
-        cosmosvaloper = self.pubkey_valoper_dict[pubkey]
-        cosmosvalcons = self.pubkey_valcons_dict.get(pubkey)
-        if cosmosvalcons is None:
-            bytes_address = consensus_pubkey_to_bytes_address(pubkey)
-            cosmosvalcons = bytes_to_consensus_address(bytes_address)
-        return {
-            'cosmosvaloper': cosmosvaloper,
-            'cosmos': cosmosvaloper_to_cosmos(cosmosvaloper),
-            'moniker': self.pubkey_moniker_dict[pubkey],
-            'pubkey': pubkey,
-            'address': address,
-            'cosmosvalcons': cosmosvalcons,
-            'bonded': True,
-            'joined': joined,
-            'left': [],
-        }
-
-    def seed_baseline(self):
-        '''
-        Fetches the active set at start_block and records it as the scan's
-        baseline, without recording a 'joined' event for it -- only
-        transitions detected after the baseline should count as joining
-        or leaving during the period.
-        '''
-        baseline = collect_rpc_validators(self.rpc, self.start_block)
-        self.load_pubkey_dicts(self.start_block)
-
-        transitions = {}
-        for val in baseline:
-            pubkey = val['pub_key']['value']
-            address = val['address']
-            if pubkey not in self.pubkey_bonded_dict:
-                logging.warning(
-                    f'Block {self.start_block}: pubkey {pubkey} (address {address}) '
-                    'missing from API validator data, skipping baseline entry'
-                )
-                continue
-            transitions[address] = self.new_transition_entry(pubkey, address, self.start_block, joined=[])
-
-        self.previous_valset = [val['address'] for val in baseline]
-        self.historical_data = {
-            'period': self.period,
-            'start_block': self.start_block,
-            'end_block': self.end_block,
-            'last_block': self.start_block,
-            'previous_valset': self.previous_valset,
-            'transitions': transitions,
-        }
-
-    def update_transitions(self, rpc_data, height: int):
-        '''
-        - Records newly seen validators (mid-period entrants)
-        - Records validators leaving the active set
-        - Records validators re-joining the active set
-        '''
-        self.load_pubkey_dicts(height)
-        current_addresses = {val['address'] for val in rpc_data}
-        pubkey_by_address = {val['address']: val['pub_key']['value'] for val in rpc_data}
-        transitions = self.historical_data['transitions']
-
-        for address in current_addresses:
-            if address in transitions:
-                continue
-            pubkey = pubkey_by_address[address]
-            if pubkey not in self.pubkey_bonded_dict:
-                logging.warning(
-                    f'Block {height}: pubkey {pubkey} (address {address}) missing from '
-                    'API validator data, skipping for this block'
-                )
-                continue
-            transitions[address] = self.new_transition_entry(pubkey, address, height, joined=[height])
-
-        for val in transitions.values():
-            pubkey = val['pubkey']
-            if pubkey not in self.pubkey_bonded_dict:
-                logging.warning(
-                    f'Block {height}: pubkey {pubkey} (moniker {val["moniker"]}) missing '
-                    'from API validator data, keeping its previous bonded status'
-                )
-                continue
-            bonded = self.pubkey_bonded_dict[pubkey] == 'BOND_STATUS_BONDED'
-            address = val['address']
-            if address not in current_addresses:
-                if val['bonded'] and not bonded:
-                    val['left'].append(height)
-            else:
-                if not val['bonded'] and bonded:
-                    val['joined'].append(height)
-            val['bonded'] = bonded
-
-    def fetch_rpc_validators_with_retry(self, height, retries=5, backoff=1.0):
-        '''
-        Fetches the RPC validator set for a single height, retrying with
-        exponential backoff if the node drops/resets the connection under
-        concurrent load.
-        '''
-        for attempt in range(retries):
-            try:
-                return collect_rpc_validators(self.rpc, height)
-            except (requests.exceptions.RequestException, KeyError) as error:
-                if attempt == retries - 1:
-                    raise
-                wait = backoff * (2 ** attempt)
-                logging.warning(
-                    f'Block {height}: fetch failed ({error}), '
-                    f'retrying in {wait:.1f}s (attempt {attempt + 1}/{retries})'
-                )
-                time.sleep(wait)
-
-    def prefetch_rpc_validators(self, heights):
-        '''
-        Fetches the RPC validator set for a batch of heights concurrently.
-        Returns a dict mapping height -> rpc validator data.
-        '''
-        results = {}
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            future_to_height = {
-                executor.submit(self.fetch_rpc_validators_with_retry, height): height
-                for height in heights
-            }
-            for future in as_completed(future_to_height):
-                height = future_to_height[future]
-                results[height] = future.result()
-        return results
-
-    def check_valset(self, height: int, rpc_validators):
-        '''
-        If the active set at this height differs from the previous one,
-        update the tracked transitions.
-        '''
-        valset_addresses = [val['address'] for val in rpc_validators]
-        if valset_addresses != self.previous_valset:
-            self.update_transitions(rpc_validators, height)
-            self.previous_valset = valset_addresses
-        self.historical_data['last_block'] = height
-
-    def scan_active_set(self):
-        '''
-        Scans the [start_block, end_block] range, resuming from a
-        checkpoint when one matches this exact period/block range.
-        '''
-        resumed = (
-            self.read_checkpoint()
-            and self.historical_data.get('start_block') == self.start_block
-            and self.historical_data.get('end_block') == self.end_block
-        )
-        if resumed:
-            self.previous_valset = self.historical_data.get('previous_valset', [])
-            range_start = self.historical_data['last_block'] + 1
-            logging.info(f'Resuming active-set scan from block {range_start}')
-        else:
-            logging.info(f'Seeding active-set baseline at block {self.start_block}')
-            self.seed_baseline()
-            range_start = self.start_block + 1
-
-        heights = list(range(range_start, self.end_block + 1))
-        for batch_start in range(0, len(heights), self.batch_size):
-            batch = heights[batch_start:batch_start + self.batch_size]
-            logging.info(f'Fetching blocks {batch[0]}-{batch[-1]} with {self.workers} workers')
-            prefetched = self.prefetch_rpc_validators(batch)
-            for height in batch:
-                self.check_valset(height, prefetched[height])
-            self.historical_data['previous_valset'] = self.previous_valset
-            self.save_checkpoint()
-        self.save_checkpoint()
-
-    # ---- jailing detection (adapted from last_jailed_recorder) ----
-
-    def scan_jailing(self):
-        '''
-        Returns a dict keyed by cosmosvalcons address, of validators whose
-        jailing (or, for tombstoned validators, whose tombstoning) is
-        estimated to fall within the period.
-        '''
-        slashing_params = get_slashing_params(self.api)
-        jail_duration = float(slashing_params['downtime_jail_duration'].split('s')[0])
-        signing_infos = get_signing_infos(self.api)
-
-        jailing = {}
-        for info in signing_infos:
-            jailed_until = info.get('jailed_until')
-            if not jailed_until:
-                continue
-            consensus_address = info['address']
-
-            if info.get('tombstoned'):
-                # A tombstone is a permanent jail: jailed_until minus the
-                # (downtime-only) jail duration means nothing here. Record
-                # it as a candidate; the merge step confirms it happened
-                # in-window using the active-set scan's 'left' heights.
-                jailing[consensus_address] = {
-                    'jailed_reason': 'tombstone',
-                    'jailed_time': None,
-                }
-                continue
-
-            jailed_until_time = clean_timestamp(jailed_until)
-            jailed_time = jailed_until_time - timedelta(seconds=jail_duration)
-            if self.start_time <= jailed_time <= self.end_time:
-                jailing[consensus_address] = {
-                    'jailed_reason': 'downtime',
-                    'jailed_time': jailed_time,
-                }
-        return jailing
+    # ---- primary jailing detection, via indexed block/tx search ----
 
     def estimate_jailed_block(self, consensus_address: str, jailed_time: datetime):
         '''
-        Fallback for validators not captured by the active-set scan (e.g.
-        jailed while already outside the tracked range): estimates the
-        block via time_to_block, then scans a narrow window around it for
-        the last block where the validator was still in the active set.
+        Estimates the jailing block via time_to_block, then scans a narrow
+        window around it for the last block where the validator was still
+        in the active set. Only used by the signing_infos fallback path --
+        the block_search path already gets an exact height from its hits.
         '''
-        jailed_time_str = jailed_time.strftime(RPC_TIME_FORMAT)
-        estimated_block, _ = time_to_block(self.rpc, jailed_time_str, precision=8, dampener=0.9)
+        estimated_block = time_to_block(self.rpc, jailed_time)
         last_block = estimated_block
         for block in range(estimated_block - 10, estimated_block + 10):
             valset = collect_api_validator_set(self.api, block)
@@ -704,6 +477,154 @@ class ValidatorReport():
                 return last_block
             last_block = block
         return last_block
+
+    def _detect_slash_jailings(self, reason: str, jailed_reason: str, tombstoned: bool):
+        '''
+        Queries block_search for slash{reason=<reason>} events in the
+        resolved block range. Returns None (not {}) if the endpoint can't
+        answer the query at all, so callers can distinguish "indexing
+        unavailable" from "zero matches, genuinely nothing happened".
+        '''
+        query = (
+            f"slash.reason='{reason}' "
+            f"AND block.height>={self.start_block} AND block.height<={self.end_block}"
+        )
+        hits = rpc_search(self.rpc, 'block_search', query)
+        if hits is None:
+            logging.warning('This endpoint likely lacks tx/block indexing support')
+            return None
+
+        results = {}
+        for hit in hits:
+            height = int(hit['block']['header']['height'])
+            block_results = get_block_results(self.rpc, height)
+            event = find_slash_event(block_results, reason)
+            if not event:
+                logging.warning(
+                    f'Block {height}: matched a {reason} slash search hit but found no '
+                    'matching slash event in block_results'
+                )
+                continue
+            cons_addr = event.get('jailed') or event.get('address')
+            if not cons_addr:
+                continue
+            jailed_time = clean_timestamp(get_block_timestamp(self.rpc, height))
+            results[cons_addr] = {
+                'jailed_block': height,
+                'jailed_time': jailed_time.strftime(TIME_FORMAT),
+                'jailed_reason': jailed_reason,
+                'tombstoned': tombstoned,
+                'burned_coins': event.get('burned_coins', ''),
+            }
+        return results
+
+    def detect_downtime_jailings(self):
+        return self._detect_slash_jailings('missing_signature', 'downtime', tombstoned=False)
+
+    def detect_doublesign_jailings(self):
+        return self._detect_slash_jailings('double_sign', 'double_sign', tombstoned=True)
+
+    def confirm_selfdelegation_jailing(self, cosmosvaloper: str, height: int) -> bool:
+        '''
+        Confirms whether a candidate self-undelegation tx actually crossed
+        MinSelfDelegation and triggered jailing, by checking whether the
+        validator's jailed flag flipped false->true across this height.
+        '''
+        before = get_validator(self.api, cosmosvaloper, height - 1)
+        after = get_validator(self.api, cosmosvaloper, height)
+        return bool(before) and bool(after) and not before.get('jailed') and after.get('jailed')
+
+    def detect_selfdelegation_jailings(self, registry: dict):
+        '''
+        MsgUndelegate never emits a jailing-specific event, so this is a
+        filter-then-confirm search: find self-undelegation txs via
+        tx_search, then confirm each candidate actually triggered jailing.
+        '''
+        query = (
+            f"message.action='/cosmos.staking.v1beta1.MsgUndelegate' "
+            f"AND tx.height>={self.start_block} AND tx.height<={self.end_block}"
+        )
+        txs = rpc_search(self.rpc, 'tx_search', query)
+        if not txs:
+            logging.info(
+                'No MsgUndelegate transactions found for this period via tx_search '
+                '(if self-undelegations are known to have occurred, verify tx indexing is enabled)'
+            )
+            return {}
+
+        valoper_by_cosmos = {v['cosmos']: v['cosmosvaloper'] for v in registry.values()}
+        valcons_by_valoper = {v['cosmosvaloper']: v['cosmosvalcons'] for v in registry.values()}
+
+        candidates = []
+        for tx in txs:
+            valoper = self_undelegation_validator(tx, valoper_by_cosmos)
+            if valoper:
+                candidates.append((valoper, int(tx['height'])))
+        if not candidates:
+            return {}
+
+        logging.info(f'Confirming jailing status for {len(candidates)} self-undelegation candidate(s)')
+        results = {}
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {
+                executor.submit(self.confirm_selfdelegation_jailing, valoper, height): (valoper, height)
+                for valoper, height in candidates
+            }
+            for future in as_completed(futures):
+                valoper, height = futures[future]
+                if not future.result():
+                    continue
+                cons_addr = valcons_by_valoper.get(valoper)
+                if not cons_addr:
+                    continue
+                jailed_time = clean_timestamp(get_block_timestamp(self.rpc, height))
+                results[cons_addr] = {
+                    'jailed_block': height,
+                    'jailed_time': jailed_time.strftime(TIME_FORMAT),
+                    'jailed_reason': 'low_self_delegation',
+                    'tombstoned': False,
+                    'burned_coins': '',
+                }
+        return results
+
+    # ---- fallback jailing detection, for endpoints without indexed search ----
+
+    def detect_via_signing_infos_fallback(self):
+        '''
+        Fallback for endpoints without block_search support. Only recovers
+        downtime jailings: JailedUntil is set to (jail time + downtime jail
+        duration), so it can be inverted. Double-sign/tombstone jailings are
+        NOT recoverable here -- JailedUntil for a tombstoned validator is a
+        fixed far-future constant unrelated to when the tombstoning
+        happened, so there's no way to confirm it fell within the period.
+        Self-delegation jailings are entirely invisible in this mode (see
+        module docstring).
+        '''
+        slashing_params = get_slashing_params(self.api)
+        jail_duration = float(slashing_params['downtime_jail_duration'].split('s')[0])
+        signing_infos = get_signing_infos(self.api)
+
+        downtime = {}
+        for info in signing_infos:
+            if info.get('tombstoned'):
+                continue
+            jailed_until = info.get('jailed_until')
+            if not jailed_until:
+                continue
+            jailed_until_time = clean_timestamp(jailed_until)
+            jailed_time = jailed_until_time - timedelta(seconds=jail_duration)
+            if not (self.start_time <= jailed_time <= self.end_time):
+                continue
+            cons_addr = info['address']
+            jailed_block = self.estimate_jailed_block(cons_addr, jailed_time)
+            downtime[cons_addr] = {
+                'jailed_block': jailed_block,
+                'jailed_time': jailed_time.strftime(TIME_FORMAT),
+                'jailed_reason': 'downtime',
+                'tombstoned': False,
+                'burned_coins': '',
+            }
+        return downtime
 
     # ---- merge + output ----
 
@@ -715,43 +636,48 @@ class ValidatorReport():
         )
 
         registry = self.build_master_registry()
-        self.scan_active_set()
-        jailing = self.scan_jailing()
-        transitions = self.historical_data['transitions']
+
+        downtime = self.detect_downtime_jailings()
+        doublesign = self.detect_doublesign_jailings()
+        if downtime is None or doublesign is None:
+            logging.warning(
+                'Indexed block_search unavailable on this endpoint; falling back to '
+                'signing_infos-based detection. This can only recover downtime jailings '
+                'still reflected in current signing info -- double-sign/tombstone timing '
+                'and low_self_delegation jailings CANNOT be detected in this mode.'
+            )
+            downtime = self.detect_via_signing_infos_fallback()
+            doublesign = {}
+            selfdeleg = {}
+            detection_method = 'signing_infos_fallback'
+        else:
+            selfdeleg = self.detect_selfdelegation_jailings(registry)
+            detection_method = 'block_search'
+
+        jailings = {}
+        for source in (downtime, doublesign, selfdeleg):
+            for cons_addr, info in source.items():
+                existing = jailings.get(cons_addr)
+                if existing and existing['jailed_block'] and info['jailed_block']:
+                    if info['jailed_block'] <= existing['jailed_block']:
+                        logging.warning(
+                            f'{cons_addr}: multiple jailing events detected in period, '
+                            'keeping the latest by block'
+                        )
+                        continue
+                jailings[cons_addr] = info
+
+        val_by_cosmosvalcons = {val['cosmosvalcons']: val for val in registry.values()}
 
         rows = []
-        for val in registry.values():
-            transition = transitions.get(val['address'])
-            left_heights = transition['left'] if transition else []
-            joined_heights = transition['joined'] if transition else []
-
-            jailed_during_period = False
-            jailed_time = ''
-            jailed_block = ''
-            jailed_reason = ''
-
-            jail_info = jailing.get(val['cosmosvalcons'])
-            if jail_info:
-                jailed_reason = jail_info['jailed_reason']
-                if jailed_reason == 'tombstone':
-                    if left_heights:
-                        jailed_during_period = True
-                        jailed_block = left_heights[-1] - 1
-                    else:
-                        # No in-window evidence of leaving the set: can't
-                        # confirm the tombstoning happened during this
-                        # period, so don't report it as such.
-                        jailed_reason = ''
-                else:
-                    jailed_during_period = True
-                    jailed_time = jail_info['jailed_time'].strftime(TIME_FORMAT)
-                    if left_heights:
-                        jailed_block = left_heights[-1] - 1
-                    else:
-                        jailed_block = self.estimate_jailed_block(
-                            val['cosmosvalcons'], jail_info['jailed_time']
-                        )
-
+        for cons_addr, jail_info in jailings.items():
+            val = val_by_cosmosvalcons.get(cons_addr)
+            if val is None:
+                logging.warning(
+                    f'{cons_addr}: jailed during period but not found in the current '
+                    'validator registry, skipping row'
+                )
+                continue
             rows.append({
                 'cosmosvaloper': val['cosmosvaloper'],
                 'cosmos': val['cosmos'],
@@ -759,16 +685,12 @@ class ValidatorReport():
                 'pubkey': val['pubkey'],
                 'address': val['address'],
                 'cosmosvalcons': val['cosmosvalcons'],
-                'bonded': val['bonded'],
-                'jailed': val['jailed'],
-                'left_active_set': bool(left_heights),
-                'left_heights': '|'.join(str(h) for h in left_heights),
-                'joined_active_set': bool(joined_heights),
-                'joined_heights': '|'.join(str(h) for h in joined_heights),
-                'jailed_during_period': jailed_during_period,
-                'jailed_time': jailed_time,
-                'jailed_block': jailed_block,
-                'jailed_reason': jailed_reason,
+                'jailed_block': jail_info.get('jailed_block', ''),
+                'jailed_time': jail_info.get('jailed_time', ''),
+                'jailed_reason': jail_info.get('jailed_reason', ''),
+                'tombstoned': jail_info.get('tombstoned', False),
+                'burned_coins': jail_info.get('burned_coins', ''),
+                'detection_method': detection_method,
             })
 
         self.save_csv(rows)
@@ -781,18 +703,17 @@ class ValidatorReport():
             'pubkey',
             'address',
             'cosmosvalcons',
-            'bonded',
-            'jailed',
-            'left_active_set',
-            'left_heights',
-            'joined_active_set',
-            'joined_heights',
-            'jailed_during_period',
-            'jailed_time',
             'jailed_block',
+            'jailed_time',
             'jailed_reason',
+            'tombstoned',
+            'burned_coins',
+            'detection_method',
         ]
         with open(self.output_file, 'w', encoding='utf-8') as output:
+            output.writelines([
+                f'Period {self.period}, blocks {self.start_block}-{self.end_block}\n'
+            ])
             writer = csv.DictWriter(output, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
@@ -806,31 +727,20 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 
-def period_type(value):
-    if not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?', value):
-        raise argparse.ArgumentTypeError(f"'{value}' is not in YYYY-MM or YYYY-MM-DD format")
-    return value
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Build a per-period report of every validator in the network: '
-                     'whether it left the active set and whether it was jailed.'
+                     'whether/when/why it was jailed.'
     )
     parser.add_argument('-r', '--rpc', type=str, required=True, help='RPC node address, including port')
     parser.add_argument('-a', '--api', type=str, required=True, help='API node address, including port')
-    parser.add_argument('-p', '--period', type=period_type, required=True, help='Period to check: YYYY-MM for a full month, or YYYY-MM-DD for a single day')
+    parser.add_argument('-p', '--period', type=str, required=True, help='Period to check, in YYYY-MM format')
     parser.add_argument('-o', '--output', type=str, help='Filename to save the validator report to (default: validator_report.<period>.csv)')
-    parser.add_argument('-i', '--input', type=str, help='Checkpoint JSON filename to resume an interrupted scan (default: validator_report.<period>.json)')
-    parser.add_argument('-w', '--workers', type=int, default=10, help='Number of concurrent worker threads for RPC fetches')
-    parser.add_argument('-b', '--batch-size', type=int, default=100, help='Number of blocks to fetch concurrently per batch')
+    parser.add_argument('-w', '--workers', type=int, default=5, help='Number of concurrent worker threads for self-delegation confirmation checks')
 
     args = parser.parse_args()
 
     output_file = args.output or f'validator_report.{args.period}.csv'
-    checkpoint_file = args.input or f'validator_report.{args.period}.json'
 
-    report = ValidatorReport(
-        args.rpc, args.api, args.period, output_file, checkpoint_file, args.workers, args.batch_size
-    )
+    report = ValidatorReport(args.rpc, args.api, args.period, output_file, args.workers)
     report.build()
