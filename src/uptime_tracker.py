@@ -9,6 +9,7 @@ Example:
 python -m tip.uptime_tracker -m 2026-07
 """
 
+import calendar
 import json
 import csv
 import argparse
@@ -758,7 +759,9 @@ if __name__ == '__main__':
 
     year_month = args.year_month
     start_time = year_month + '-01T00:00:00.000Z'
-    end_time = year_month + '-31T23:59:00.000Z'
+    year, month = map(int, year_month.split('-'))
+    last_day = calendar.monthrange(year, month)[1]
+    end_time = f'{year_month}-{last_day:02d}T23:59:00.000Z'
 
     chain_id = get_chain_id(RPC_NODE)
 
