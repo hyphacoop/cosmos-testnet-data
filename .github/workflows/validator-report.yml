@@ -37,7 +37,8 @@ jobs:
 
       - name: Get current running gaiad version
         run: |
-          RUNNING_VERSION=$(curl -s $RPC_NODE/abci_info | jq -r '.result.response.version')
+          #RUNNING_VERSION=$(curl -s $RPC_NODE/abci_info | jq -r '.result.response.version')
+          RUNNING_VERSION="v28.0.0"
           echo "Running gaiad version: $RUNNING_VERSION"
           echo "RUNNING_VERSION=$RUNNING_VERSION" >> $GITHUB_ENV
 
