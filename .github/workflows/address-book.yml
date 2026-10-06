@@ -1,0 +1,55 @@
+name: Address Book
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run daily at 00:00 UTC
+    - cron: '0 0 * * *'
+
+jobs:
+  address-book:
+    runs-on: cosmos-runner-set
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - network: mainnet
+            rpc: 'https://rpc.sentry-01.cosmoshub-4.polypore.xyz'
+            api: 'https://rest.sentry-01.cosmoshub-4.polypore.xyz'
+          - network: testnet
+            rpc: 'https://rpc.provider-sentry-01.hub-testnet.polypore.xyz'
+            api: 'https://rest.provider-sentry-01.hub-testnet.polypore.xyz'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Create virtual environment
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compute date
+        id: date
+        run: echo "today=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Build address book
+        working-directory: src
+        run: |
+          python address_book_builder.py \
+            -r "${{ matrix.rpc }}" \
+            -a "${{ matrix.api }}" \
+            -o "address_book.${{ matrix.network }}.${{ steps.date.outputs.today }}.csv"
+
+      - name: Upload address book CSV
+        uses: actions/upload-artifact@v7
+        with:
+          name: address-book-${{ matrix.network }}-${{ steps.date.outputs.today }}
+          path: src/address_book.${{ matrix.network }}.${{ steps.date.outputs.today }}.csv
