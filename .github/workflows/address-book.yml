@@ -3,8 +3,8 @@ name: Address Book
 on:
   workflow_dispatch:
   schedule:
-    # Run daily at 00:00 UTC
-    - cron: '0 0 * * *'
+    # Run Tuesdays at 10:00 UTC
+    - cron: '0 10 * * 2'
 
 jobs:
   address-book:
