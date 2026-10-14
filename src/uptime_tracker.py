@@ -21,6 +21,7 @@ import base64
 import hashlib
 import urllib
 import requests
+import time
 import command
 from datetime import datetime
 
@@ -97,16 +98,24 @@ def cosmosvaloper_to_cosmos(address, binary: str = "gaiad"):
     return res_json["formats"][0]
 
 
-def signatures_bytes_addrs(urlRPC, block: int = 1):
+def signatures_bytes_addrs(urlRPC, block: int = 1, retries: int = 5):
     """
     Returns a list of the last commit's signatures for a given block
     in bytes format.
     """
-    if block > 1:
-        # Use a 5s timeout to avoid hanging if the node is unresponsive
-        res = requests.get(f"{urlRPC}/commit?height={block}", timeout=5).json()["result"]
-    else:
-        res = requests.get(f"{urlRPC}/commit", timeout=5).json()["result"]
+    url = f"{urlRPC}/commit?height={block}" if block > 1 else f"{urlRPC}/commit"
+    # Use a 5s timeout to avoid hanging if the node is unresponsive,
+    # and retry with backoff so a single slow response doesn't abort a long run
+    for attempt in range(retries):
+        try:
+            res = requests.get(url, timeout=5).json()["result"]
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** attempt
+            logging.warning(f"Request for block {block} failed ({e}), retrying in {wait}s.")
+            time.sleep(wait)
     signatures = res["signed_header"]["commit"]["signatures"]
     addresses = [
         sig["validator_address"] for sig in signatures if sig["validator_address"]
