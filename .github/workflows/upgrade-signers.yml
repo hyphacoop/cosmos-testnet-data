@@ -1,0 +1,50 @@
+name: Upgrade Signers
+
+on:
+  workflow_dispatch:
+    inputs:
+      upgrade_name:
+        description: 'Upgrade name (e.g. v29.0.0)'
+        required: true
+        type: string
+
+env:
+  RPC_NODE: 'https://rpc.provider-sentry-02.hub-testnet.polypore.xyz'
+  API_NODE: 'https://rest.provider-sentry-02.hub-testnet.polypore.xyz'
+
+jobs:
+  upgrade-signers:
+    runs-on: cosmos-runner-set
+    env:
+      UPGRADE: ${{ inputs.upgrade_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Create virtual environment
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Record upgrade signers
+        working-directory: src
+        run: |
+          python upgrade_signers.py \
+            -r "$RPC_NODE" \
+            -a "$API_NODE" \
+            -u "$UPGRADE" \
+            -o "upgrade_signers.testnet.$UPGRADE.csv"
+
+      - name: Upload signers CSV
+        uses: actions/upload-artifact@v7
+        with:
+          name: upgrade-signers-testnet-${{ inputs.upgrade_name }}
+          path: src/upgrade_signers.testnet.${{ inputs.upgrade_name }}.csv
