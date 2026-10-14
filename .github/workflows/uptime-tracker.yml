@@ -2,6 +2,16 @@ name: Uptime Tracker
 
 on:
   workflow_call:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date (YYYY-MM-DD, UTC, inclusive)'
+        required: true
+        type: string
+      end_date:
+        description: 'End date (YYYY-MM-DD, UTC, inclusive)'
+        required: true
+        type: string
 
 env:
   RPC_NODE: 'https://rpc.provider-sentry-02.hub-testnet.polypore.xyz'
@@ -45,9 +55,30 @@ jobs:
           sudo chmod +x /usr/local/bin/gaiad
           gaiad version
 
-      - name: Compute last month
+      - name: Compute period
         id: date
-        run: echo "year_month=$(date -d 'last month' +%Y-%m)" >> "$GITHUB_OUTPUT"
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+        run: |
+          if [ -n "$START_DATE" ] && [ -n "$END_DATE" ]; then
+            for d in "$START_DATE" "$END_DATE"; do
+              if [ "$(date -d "$d" +%F 2>/dev/null)" != "$d" ]; then
+                echo "::error::Invalid date '$d', expected YYYY-MM-DD"
+                exit 1
+              fi
+            done
+            if [[ "$START_DATE" > "$END_DATE" ]]; then
+              echo "::error::start_date must not be after end_date"
+              exit 1
+            fi
+            echo "period=${START_DATE}_${END_DATE}" >> "$GITHUB_OUTPUT"
+            echo "args=--start-date $START_DATE --end-date $END_DATE" >> "$GITHUB_OUTPUT"
+          else
+            PERIOD=$(date -d 'last month' +%Y-%m)
+            echo "period=$PERIOD" >> "$GITHUB_OUTPUT"
+            echo "args=-m $PERIOD" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Run uptime tracker
         working-directory: src
@@ -55,10 +86,10 @@ jobs:
           python uptime_tracker.py \
             -r "$RPC_NODE" \
             -a "$API_NODE" \
-            -m ${{ steps.date.outputs.year_month }}
+            ${{ steps.date.outputs.args }}
 
       - name: Upload uptime CSV
         uses: actions/upload-artifact@v7
         with:
-          name: uptime-${{ steps.date.outputs.year_month }}
-          path: src/${{ steps.date.outputs.year_month }}-*-uptime.csv
+          name: uptime-${{ steps.date.outputs.period }}
+          path: src/${{ steps.date.outputs.period }}-*-uptime.csv
