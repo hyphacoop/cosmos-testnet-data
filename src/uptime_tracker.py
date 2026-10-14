@@ -7,6 +7,7 @@ dependency on the rest of the cosmos-tools package.
 
 Example:
 python -m tip.uptime_tracker -m 2026-07
+python -m tip.uptime_tracker --start-date 2026-07-01 --end-date 2026-07-15
 """
 
 import calendar
@@ -743,6 +744,14 @@ def year_month_type(value):
     return value
 
 
+def date_type(value):
+    try:
+        datetime.strptime(value, '%Y-%m-%d')
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{value}' is not a valid YYYY-MM-DD date")
+    return value
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Record accounts and signed blocks in the current month.'
@@ -751,17 +760,29 @@ if __name__ == '__main__':
     parser.add_argument('-a', '--api', type=str, help='API node address, including port', default='https://rest.provider-sentry-02.ics-testnet.polypore.xyz:443')
     parser.add_argument('-s', '--step', type=int, help='Check step size', default=10)
     parser.add_argument('-m', '--year-month', type=year_month_type, help='Month to record, in YYYY-MM format', default=datetime.now().strftime('%Y-%m'))
+    parser.add_argument('--start-date', type=date_type, help='First day to record (YYYY-MM-DD, UTC); overrides --year-month')
+    parser.add_argument('--end-date', type=date_type, help='Last day to record, inclusive (YYYY-MM-DD, UTC); overrides --year-month')
     args = parser.parse_args()
+    if bool(args.start_date) != bool(args.end_date):
+        parser.error('--start-date and --end-date must be used together')
+    if args.start_date and args.start_date > args.end_date:
+        parser.error('--start-date must not be after --end-date')
 
     RPC_NODE = args.rpc
     API_NODE = args.api
     STEP_SIZE = args.step
 
-    year_month = args.year_month
-    start_time = year_month + '-01T00:00:00.000Z'
-    year, month = map(int, year_month.split('-'))
-    last_day = calendar.monthrange(year, month)[1]
-    end_time = f'{year_month}-{last_day:02d}T23:59:00.000Z'
+    if args.start_date:
+        period = f'{args.start_date}_{args.end_date}'
+        start_time = f'{args.start_date}T00:00:00.000Z'
+        end_time = f'{args.end_date}T23:59:00.000Z'
+    else:
+        year_month = args.year_month
+        period = year_month
+        start_time = year_month + '-01T00:00:00.000Z'
+        year, month = map(int, year_month.split('-'))
+        last_day = calendar.monthrange(year, month)[1]
+        end_time = f'{year_month}-{last_day:02d}T23:59:00.000Z'
 
     chain_id = get_chain_id(RPC_NODE)
 
@@ -777,9 +798,9 @@ if __name__ == '__main__':
         start_height=start_height,
         end_height=end_height,
         step_size=STEP_SIZE,
-        signature_count=f'{chain_id}-count-{year_month}.json',
+        signature_count=f'{chain_id}-count-{period}.json',
         read_previous_data=True,
-        previous_run_data=f'{chain_id}-count-{year_month}.json'
+        previous_run_data=f'{chain_id}-count-{period}.json'
     )
     counter.count_signatures()
     block_count = counter.signatures['counter']
@@ -827,7 +848,7 @@ if __name__ == '__main__':
         }
         entries.append(entry)
 
-    output_filename = f'{year_month}-{chain_id}-uptime.csv'
+    output_filename = f'{period}-{chain_id}-uptime.csv'
     print(f'> Saving to {output_filename}.')
     with open(output_filename, 'w', encoding='utf-8') as output:
         headers = list(entries[0].keys())
