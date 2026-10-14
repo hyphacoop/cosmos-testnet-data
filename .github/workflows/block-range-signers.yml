@@ -1,0 +1,56 @@
+name: Block Range Signers
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_block:
+        description: 'Start block height'
+        required: true
+        type: number
+      end_block:
+        description: 'End block height (not included)'
+        required: true
+        type: number
+
+env:
+  RPC_NODE: 'https://rpc.provider-sentry-02.hub-testnet.polypore.xyz'
+  API_NODE: 'https://rest.provider-sentry-02.hub-testnet.polypore.xyz'
+
+jobs:
+  block-range-signers:
+    runs-on: cosmos-runner-set
+    env:
+      START: ${{ inputs.start_block }}
+      END: ${{ inputs.end_block }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Create virtual environment
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Record block range signers
+        working-directory: src
+        run: |
+          python block_range_signers.py \
+            -r "$RPC_NODE" \
+            -a "$API_NODE" \
+            -s "$START" \
+            -e "$END" \
+            -o "block_range_signers.testnet.$START-$END.csv"
+
+      - name: Upload signers CSV
+        uses: actions/upload-artifact@v7
+        with:
+          name: block-range-signers-testnet-${{ inputs.start_block }}-${{ inputs.end_block }}
+          path: src/block_range_signers.testnet.${{ inputs.start_block }}-${{ inputs.end_block }}.csv
