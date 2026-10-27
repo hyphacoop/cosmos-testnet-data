@@ -1,0 +1,50 @@
+name: Proposal Voters
+
+on:
+  workflow_dispatch:
+    inputs:
+      proposal_id:
+        description: 'Proposal ID'
+        required: true
+        type: number
+
+env:
+  RPC_NODE: 'https://rpc.provider-sentry-02.hub-testnet.polypore.xyz'
+  API_NODE: 'https://rest.provider-sentry-02.hub-testnet.polypore.xyz'
+
+jobs:
+  proposal-voters:
+    runs-on: cosmos-runner-set
+    env:
+      PROPOSAL: ${{ inputs.proposal_id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Create virtual environment
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Collect proposal voters
+        working-directory: src
+        run: |
+          python voters.py \
+            -r "$RPC_NODE" \
+            -a "$API_NODE" \
+            -p "$PROPOSAL" \
+            -o "voters.testnet.$PROPOSAL.csv"
+
+      - name: Upload voters CSV
+        uses: actions/upload-artifact@v7
+        with:
+          name: proposal-voters-testnet-${{ inputs.proposal_id }}
+          path: src/voters.testnet.${{ inputs.proposal_id }}.csv
